@@ -1,0 +1,22 @@
+# okolja in predpomnilniki
+.venv/
+.venv64/
+__pycache__/
+*.pyc
+.idea/
+
+# testni DMR (velike datoteke, se ustvarijo ob zagonu)
+izhod/_test_dmr/
+
+# HIDRO5 (~2,1 GB, presega omejitev GitHuba) – pridobi pri viru podatkov
+SHP/HIDRO5_LIN_PV_TIPTV1_2.shp
+SHP/HIDRO5_LIN_PV_TIPTV1_2.dbf
+SHP/HIDRO5_LIN_PV_TIPTV1_2.shx
+SHP/HIDRO5_LIN_PV_TIPTV1_2.sbn
+SHP/HIDRO5_LIN_PV_TIPTV1_2.sbx
+
+# začasne datoteke
+*.part
+*.gpkg-journal
+*.gpkg-wal
+*.gpkg-shm
