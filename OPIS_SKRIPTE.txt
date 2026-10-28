@@ -1,0 +1,214 @@
+OPIS SKRIPTE vodozbirna_obmocja.py
+=====================================================================
+
+Različica:   28. 10. 2026
+Repozitorij: https://github.com/davorrozmanmobile-ctrl/vodozbirna_obmocja
+Okolje:      Python 3.10+ (64-bit), knjižnice v requirements.txt
+             (preizkušeno: Python 3.13.0, geopandas 1.2.0, shapely 2.2.0, pyogrio 0.13.0,
+             rasterio 1.5.2, laspy 2.7.0 + lazrs, WhiteboxTools v2.0.0)
+Koordinatni sistem: EPSG:3794 (D96/TM)
+
+
+1. NAMEN
+---------------------------------------------------------------------
+Skripta za izbrano hidrografsko območje III. ravni (HGO III) vzdolž vodne mreže HIDRO5 postavi
+hidrološke profile na izbrani razdalji in za vsak profil izračuna vodozbirno območje (zaledje).
+Profili se ustvarijo le, dokler je zaledje >= minimalni površini. Upoštevata se smer toka in
+hierarhija vodne mreže. Atributi izhodov se prenesejo iz HIDRO5 (sledljivost do vira).
+
+DMR se ustvari začasno iz listov LAZ CLSS 2023–2025 (GURS) v izbrani velikosti celice in se po
+obdelavi izbriše (tudi ob napaki).
+
+
+2. ZAGON IN VHODNI PARAMETRI
+---------------------------------------------------------------------
+    .venv64\Scripts\python vodozbirna_obmocja.py
+
+Skripta vpraša (privzeta vrednost v oklepaju, Enter = privzeto):
+  1. mapa sloja HIDRO5                 [<mapa skripte>\SHP]
+  2. ime sloja HIDRO5                  [HIDRO5_LIN_PV_TIPTV1_2.shp]
+  3. mapa sloja HGO                    [= mapa HIDRO5]
+  4. ime sloja HGO                     [DRSV_HGO_III.shp]
+  5. HGOIII_ID obravnavanega območja   (obvezno; ob napačnem ID izpiše razpoložljive)
+  6. razdalja med profili [m]          [2500]
+  7. velikost celice DMR [m]           [5]
+  8. minimalna površina zaledja [km2]  [10]
+  9. največje število listov LAZ       [500]  (ob preseženi meji se ustavi)
+ 10. mapa izhoda                       -> <mapa>\<HGOIII_ID>.gpkg
+
+Če je izhodni GPKG odprt v drugem programu (npr. QGIS), skripta to javi. Rezultat se zapiše v
+začasno datoteko in šele na koncu zamenja obstoječega (ob napaki stari rezultat ostane).
+
+Vhodni podatki:
+  - HIDRO5_LIN_PV_TIPTV1_2.shp – vodna mreža (linije, ~400 000), ključna polja:
+      ID_REG_HLI (ID linije), VODE_ID (hierarhična šifra vodotoka: "1" = Sava,
+      "1-31552" = pritok Save ...), IME, STALN_ID, POTEK_ID ...
+      Opomba: VTOK_ID je vrsta toka, NI ID vodotoka.
+  - DRSV_HGO_III.shp – hidrografska območja III. ravni (HGOIII_ID, HGOIII_IME, HGOII_*, HGOI_*).
+  - DMR: WFS https://lift.clss.si/geoserver/wfs (sloj tileindex_clss_zdruzeno),
+         prenos https://assets.flycom.si/ + path_dmr (listi LAZ 1 x 1 km), glej CLAUDE.md.
+
+
+3. POTEK OBDELAVE (7 korakov, napredek se sproti izpisuje)
+---------------------------------------------------------------------
+1/7 Branje HGO in HIDRO5
+    - HGO se združi po HGOIII_ID; območje DMR = HGO + 500 m (BUFFER_M). Gorvodni HGO se ne
+      rastrirajo, ampak se v zaledja dodajo kot vektorski poligoni.
+    - HIDRO5: vsi atributi znotraj območja, za topologijo med HGO pa celotna mreža (le geometrija
+      in ključna polja).
+
+2/7 Seznam in prenos listov DMR
+    - Poizvedba WFS po bbox, preverjanje listov na strani odjemalca, izpis manjkajočih listov.
+    - Podvojeni listi (več območij zajema) -> uporabi se novejši zajem (datum_za_1), opozorilo.
+    - Prenos s premorom >= 3 s, upoštevanje HTTP 429 / Retry-After, ponovitve ob prekinjeni
+      povezavi (do 5x), prenos v .part in nato preimenovanje.
+    - Vsak prenos v manifest: list, URL, velikost, SHA-256, čas (UTC).
+    - CRS se prebere iz glave LAZ (ne privzema se); če ni EPSG:3794 -> ustavitev; če ga ni ->
+      izpis in preverjanje, da točke ležijo v listu.
+
+3/7 Izdelava začasnega DMR
+    - celica >= 2 m (PRAG_HITRO_M): povprečje točk LAZ v celici + zapolnitev vrzeli
+      (GDAL fillnodata, do 1000 m), izven pokritosti listov nodata; ~10x hitreje kot TIN.
+    - celica < 2 m: TIN gridiranje (WhiteboxTools lidar_tin_gridding), mozaik, obrez.
+    - Hidrološka priprava: vžig linij HIDRO5 (5 m, all_touched), breach_depressions_least_cost
+      (do 100 m), fill_depressions (fix_flats, 0,001 m), d8_pointer, d8_flow_accumulation.
+    - Višinski sistem LAZ se ne privzema; za smer toka so pomembne le relativne višine.
+
+4/7 Smer toka in topologija HGO
+    - Smer = smer digitalizacije HIDRO5 (~98 % linij je digitaliziranih dolvodno). DMR določi le
+      skupno smer mreže; neskladja posameznih linij (prag 0,5 m) se označijo (SMER_DMR_NESKLADJE).
+    - Gorvodni HGO: iz topologije celotne HIDRO5. Sosednji HGO je gorvoden le prek "glavnega
+      odtoka" (vodotok z največjo dolžino v sosednjem HGO med tistimi, ki iz njega izstopijo);
+      ostala prečkanja meje se zapišejo z GLAVNI_ODTOK=0 in ne prispevajo zaledja HGO.
+
+5/7 Profili
+    - Za vsak vodotok (VODE_ID) se tvori deblo = najdaljša pot od izliva navzgor; stacionaža se
+      meri od izliva (sotočje ali izstop iz HGO) gorvodno.
+    - Profili na stacionažah k x razdalja; profil ob izlivu se zamakne za max(10 celic, 50 m)
+      gorvodno (da se ne pripne na sprejemnik), pri prekratkih deblih se izpusti.
+    - Pripenjanje na celico z največjo akumulacijo v radiju 1 celice.
+    - Dolvodni profil (drevo profilov) po D8 sledenju; prispevek gorvodnih HGO se prenese na vse
+      profile dolvodno od vtoka.
+    - Ohranijo se profili z A_KM2 >= minimalna površina.
+
+6/7 Vodozbirna območja
+    - WhiteboxTools watershed za vse profile hkrati -> med-območja -> vektorji.
+    - Topološka poenostavitev Douglas-Peucker: skupne meje med-območij se poenostavijo enkrat
+      (brez rež in prekrivanj), toleranca = 1 x velikost celice DMR (SIMPLIFY_CELIC).
+      Poligoni gorvodnih HGO ostanejo nespremenjeni.
+    - Celotno zaledje = unija lastnega in vseh gorvodnih med-območij + poligoni gorvodnih HGO.
+    - ROB_DMR označi zaledja, ki sežejo do roba DMR.
+
+7/7 Zapis GPKG in čiščenje
+    - Vodna mreža: od vsakega profila po usmerjeni mreži HIDRO5 navzdol (po vseh linijah, na
+      razcepih ostane na istem vodotoku) do naslednjega profila ali izstopa iz HGO.
+      Vrzeli v HIDRO5 do 150 m (PREMOSTITEV_M) se premostijo z ravnim odsekom; linije, ki tečejo
+      v isti slepi konec (ponor), niso kandidati za premostitev. Večje vrzeli (ponikalnice) se
+      izpišejo kot opozorilo.
+    - Začasna mapa (LAZ, DMR, rastri) se izbriše.
+
+
+4. IZHOD: <izhod>\<HGOIII_ID>.gpkg (EPSG:3794)
+---------------------------------------------------------------------
+Vsi sloji imajo predpono HGOIII_ID (npr. 111_profili).
+
+<HGO>_profili (Point) – hidrološki profili
+    PROFIL_ID       {HGOIII_ID}_{VODE_ID}_{STAC_M:06d}[_K{n}]
+    HGOIII_ID       obravnavano HGO
+    SKUPINA         ključ vodotoka (VODE_ID:...)
+    KOMPONENTA      zaporedna št. dela vodotoka, če je vodotok v HGO razdeljen (sicer prazno)
+    STAC_M          stacionaža od izliva vodotoka [m]
+    ID_REG_HLI ... VERZIJA   atributi izvorne linije HIDRO5 (ID_REG_HLI, HLINPV_ID, HLINPV_IM,
+                    VODE_ID, HMZ_ID, IME_ID, IME, VRSTA_ID, VRSTA_IME, VTOK_ID, VTOK_IM,
+                    TIPTV_ID, TIPTV_IM, POTEK_ID, POTEK_IM, STALN_ID, VERZIJA)
+    VODE_RED        hierarhični red vodotoka (število členov VODE_ID)
+    VODE_ID_NADR    VODE_ID nadrejenega vodotoka (sprejemnika)
+    A_DMR_KM2       zaledje iz DMR [km2]
+    A_GORV_KM2      prispevek gorvodnih HGO [km2]
+    A_KM2           celotno zaledje [km2]
+    GORV_HGO        seznam gorvodnih HGOIII_ID (ločeno s ;)
+    GORV_IZVEN      1 = del zaledja izven Slovenije (podatki manjkajo)
+    DOLV_PROFIL     PROFIL_ID prvega dolvodnega profila
+    ROB_DMR         0 = ne seže do roba DMR; 1 = seže do roba (zaledje morda nepopolno);
+                    2 = seže do roba, gorvodni HGO dodani
+    SMER_OBRNJENA   1 = smer linije obrnjena glede na digitalizacijo
+    SMER_DMR_NESKLADJE  1 = smer linije v nasprotju z DMR
+    DMR_CELICA_M    velikost celice DMR
+    DAT_IZRACUNA    datum izračuna
+    X, Y            lega na liniji HIDRO5
+    X_SNAP, Y_SNAP  lega pripete celice DMR
+
+<HGO>_vodozbirna_obmocja (MultiPolygon) – celotna zaledja (prekrivajoča se)
+    enaka polja kot profili (brez X/Y) + OBSEG_KM
+
+<HGO>_medobmocja (MultiPolygon) – med-območja med zaporednimi profili
+    PROFIL_ID, DOLV_PROFIL, A_KM2
+
+<HGO>_vodna_mreza (MultiLineString) – uporabljena vodna mreža
+    HGOIII_ID, SKUPINA, KOMPONENTA, STAC_OD, STAC_DO (stacionaža, le na deblih vodotokov),
+    atributi HIDRO5, SMER_OBRNJENA, SMER_DMR_NESKLADJE,
+    VIR ("HIDRO5" ali "premostitev vrzeli v HIDRO5 (<= 150 m)"), DOLZINA_M
+
+<HGO>_vtoki (Point) – vstopi vodotokov iz sosednjih HGO / tujine
+    ID_REG_HLI, VODE_ID, IZ_HGO, GLAVNI_ODTOK (1 = upoštevan), GORV_HGO, IZVEN_HGO,
+    A_GORV_KM2, PRVI_PROFIL
+
+<HGO>_manifest_dmr (tabela) – LIST, URL, VELIKOST_B, SHA256, CAS_UTC, CRS_GLAVA,
+    VIS_SISTEM, ST_TOCK
+
+<HGO>_parametri (tabela) – vsi vnosi, konstante, opis obdelave DMR, manjkajoči listi,
+    čas začetka/konca, različice knjižnic
+
+
+5. KONSTANTE (začetek skripte)
+---------------------------------------------------------------------
+    BUFFER_M = 500          buffer okoli HGO za DMR [m]
+    BURN_M = 5              globina vžiga HIDRO5 [m]
+    BREACH_M = 100          največja dolžina preboja depresij [m]
+    FLAT_M = 0.001          naklon ravnin po zapolnitvi [m/celico]
+    PRAG_HITRO_M = 2        celica >= prag: povprečenje namesto TIN [m]
+    ZAPOLNI_M = 1000        največja razdalja zapolnjevanja vrzeli DMR [m]
+    SIMPLIFY_CELIC = 1.0    toleranca poenostavitve [x celica]
+    SNAP_CELIC = 1          radij pripenjanja profila [celic]
+    PREMOSTITEV_M = 150     največja premoščena vrzel v HIDRO5 [m]
+    ZAMIK_IZLIV_CELIC = 10  zamik profila ob izlivu [celic, vsaj 50 m]
+    PRAG_SMERI_M = 0.5      višinska razlika za preverjanje smeri [m]
+    PREMOR_S = 3            premor med prenosi [s]
+    MAX_PONOVITEV = 5       ponovitve prenosa
+
+
+6. PRAVILA VIRA DMR (CLAUDE.md)
+---------------------------------------------------------------------
+    - premor med prenosi >= 3 s, HTTP 429 -> Retry-After
+    - omejitev števila listov na zagon (večje količine: gic.gu@gov.si)
+    - CRS in višinski sistem LAZ se ne privzemata (branje iz glave)
+    - manifest vsakega prenosa (list, URL, velikost, SHA-256, čas UTC)
+    - brez gesel, ključev ali povezovalnih nizov v kodi
+    - obdelava DMR (gridiranje z zapolnitvijo, vžig, breach/fill) je izrecno dovoljena izjema
+      in je zapisana v tabeli parametri
+
+
+7. TESTNI REZULTATI (DMR 5 m, razmik 2500 m, A_min 10 km2)
+---------------------------------------------------------------------
+    HGO   ime               profilov  max. zaledje   vodna mreža           listov LAZ
+    111   Sava Dolinka        61       483,3 km2     931 odsekov, 110,2 km   ~635
+    112   Sava Bohinjka       50       371,0 km2     455 odsekov,  69,7 km   501
+    113   Sava – Podnart      20       978,7 km2     288 odsekov,  35,4 km   210
+          (113 vključuje gorvodna HGO 111 in 112)
+
+    Čas izračuna (5 m, povprečenje): ~5 min za 111 brez prenosa; prenos ~4 s/list.
+
+
+8. ZNANE OMEJITVE IN OPOZORILA
+---------------------------------------------------------------------
+    - ROB_DMR = 1: zaledje seže do roba DMR (npr. kraške planote Jelovica, Pokljuka, Komna);
+      zaledje po DMR je lahko nepopolno ali razvodnica ne sovpada s HGO.
+    - Ponikalnice: vodotoki, ki se v HIDRO5 končajo slepo (vrzel > 150 m), niso povezani v sloju
+      vodne mreže (113: Blatnica; 112: 3 vodotoki na Pokljuki/Komni). Zaledje in DOLV_PROFIL
+      sta določena po DMR in sta pravilna.
+    - Manjkajoči listi DMR (izven pokritosti CLSS, npr. Italija/Avstrija) se izpišejo in
+      zapišejo v parametri (LISTI_MANJKAJO).
+    - WhiteboxTools v2.0 občasno pade pri zapisu -> skripta orodje enkrat ponovi.
+    - Sistemske spremenljivke PROJ_LIB/GDAL_DATA (npr. iz PostGIS) se ob zagonu odstranijo, ker
+      povzročajo napake rasterio.
+    - Interpreter v IDE mora biti .venv64 (64-bit); 32-bitni .venv nima potrebnih knjižnic.
